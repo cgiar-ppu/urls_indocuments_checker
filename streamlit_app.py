@@ -7,11 +7,13 @@ from urllib.parse import urlparse
 from docx.opc.constants import RELATIONSHIP_TYPE as RT
 import io
 import pandas as pd
-from collections import OrderedDict
+from collections import OrderedDict, defaultdict
 import asyncio
 import aiohttp
 from concurrent.futures import ThreadPoolExecutor
 import nest_asyncio
+from itertools import groupby
+from operator import itemgetter
 nest_asyncio.apply()
 
 def extract_hyperlinks_from_docx(docx_file):
@@ -78,35 +80,52 @@ def extract_hyperlinks_from_docx(docx_file):
     
     return url_info
 
-async def check_url_async(session, url):
+def get_domain(url):
+    """Extract domain from URL."""
+    try:
+        parsed = urlparse(url)
+        return parsed.netloc
+    except:
+        return url
+
+async def check_url_async(session, url, delay=1):
     """Asynchronously check if a URL is accessible and return its status and content."""
     try:
         headers = {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
         }
+        
+        # First request to check accessibility
         async with session.get(url, headers=headers, timeout=10) as response:
-            text = await response.text()
+            status = response.status
             
-            # Try to get readable content using BeautifulSoup
-            soup = BeautifulSoup(text, 'html.parser')
+            # Wait before getting content
+            await asyncio.sleep(delay)
             
-            # Remove script and style elements
-            for script in soup(["script", "style"]):
-                script.decompose()
+            # Second request to get content
+            async with session.get(url, headers=headers, timeout=10) as content_response:
+                text = await content_response.text()
                 
-            # Get text content
-            content = soup.get_text()
-            
-            # Clean up text
-            lines = (line.strip() for line in content.splitlines())
-            chunks = (phrase.strip() for line in lines for phrase in line.split("  "))
-            content = ' '.join(chunk for chunk in chunks if chunk)
-            
-            return {
-                'status': 'Success',
-                'status_code': response.status,
-                'content_preview': content[:500] + '...' if len(content) > 500 else content
-            }
+                # Try to get readable content using BeautifulSoup
+                soup = BeautifulSoup(text, 'html.parser')
+                
+                # Remove script and style elements
+                for script in soup(["script", "style"]):
+                    script.decompose()
+                    
+                # Get text content
+                content = soup.get_text()
+                
+                # Clean up text
+                lines = (line.strip() for line in content.splitlines())
+                chunks = (phrase.strip() for line in lines for phrase in line.split("  "))
+                content = ' '.join(chunk for chunk in chunks if chunk)
+                
+                return {
+                    'status': 'Success',
+                    'status_code': status,
+                    'content_preview': content[:500] + '...' if len(content) > 500 else content
+                }
     except Exception as e:
         return {
             'status': 'Error',
@@ -114,38 +133,53 @@ async def check_url_async(session, url):
             'content_preview': str(e)
         }
 
+async def process_domain_group(session, domain_urls, delay=1):
+    """Process all URLs from the same domain with delays."""
+    results = []
+    for url, occurrences in domain_urls:
+        # Wait before processing next URL from same domain
+        await asyncio.sleep(delay)
+        result = await check_url_async(session, url, delay)
+        result['occurrences'] = occurrences
+        results.append((url, result))
+    return results
+
 async def check_urls_batch(urls_dict):
-    """Check multiple URLs concurrently in batches."""
+    """Check multiple URLs concurrently, but handle same-domain URLs sequentially."""
     async with aiohttp.ClientSession() as session:
-        tasks = []
         results = {'success': [], 'failed': []}
         
-        # Create tasks for all URLs
+        # Group URLs by domain
+        domain_groups = defaultdict(list)
         for url, occurrences in urls_dict.items():
-            task = asyncio.ensure_future(check_url_async(session, url))
-            tasks.append((url, occurrences, task))
+            domain = get_domain(url)
+            domain_groups[domain].append((url, occurrences))
         
-        # Process URLs in batches of 5
-        batch_size = 5
-        for i in range(0, len(tasks), batch_size):
-            batch = tasks[i:i + batch_size]
-            
-            # Wait for the current batch to complete
-            for url, occurrences, task in batch:
-                result = await task
-                result['occurrences'] = occurrences
-                
+        # Create tasks for each domain group
+        tasks = []
+        for domain, domain_urls in domain_groups.items():
+            task = asyncio.ensure_future(process_domain_group(session, domain_urls))
+            tasks.append(task)
+        
+        # Process domain groups concurrently (but URLs within each domain sequentially)
+        total_urls = len(urls_dict)
+        processed_urls = 0
+        
+        # Wait for all domain groups to complete
+        for domain_results in asyncio.as_completed(tasks):
+            domain_processed = await domain_results
+            for url, result in domain_processed:
                 if result['status'] == 'Success':
                     results['success'].append({'url': url, **result})
                 else:
                     results['failed'].append({'url': url, **result})
                 
-                # Update progress (if needed)
-                progress = (i + len(batch)) / len(tasks)
+                processed_urls += 1
+                # Update progress
                 if 'progress_bar' in st.session_state:
-                    st.session_state.progress_bar.progress(progress)
+                    st.session_state.progress_bar.progress(processed_urls / total_urls)
                 if 'status_text' in st.session_state:
-                    st.session_state.status_text.text(f"Processed {i + len(batch)} of {len(tasks)} URLs")
+                    st.session_state.status_text.text(f"Processed {processed_urls} of {total_urls} URLs")
         
         return results
 
@@ -243,19 +277,6 @@ def main():
                             st.dataframe(failed_df, use_container_width=True)
                         else:
                             st.write("No failed URLs found.")
-                    
-                    # Show statistics
-                    st.markdown("---")
-                    st.markdown("### 📊 Statistics")
-                    stats_col1, stats_col2, stats_col3, stats_col4 = st.columns(4)
-                    with stats_col1:
-                        st.metric("Total URLs", total_urls)
-                    with stats_col2:
-                        st.metric("Unique URLs", unique_urls)
-                    with stats_col3:
-                        st.metric("Working URLs", len(results['success']))
-                    with stats_col4:
-                        st.metric("Failed URLs", len(results['failed']))
                     
                     # Add export functionality
                     if st.button("📥 Export Results to CSV"):
