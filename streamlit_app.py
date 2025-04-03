@@ -3,7 +3,7 @@ import docx
 import requests
 from bs4 import BeautifulSoup
 import re
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urljoin
 from docx.opc.constants import RELATIONSHIP_TYPE as RT
 import io
 import pandas as pd
@@ -14,6 +14,8 @@ from concurrent.futures import ThreadPoolExecutor
 import nest_asyncio
 from itertools import groupby
 from operator import itemgetter
+import mimetypes
+import time
 nest_asyncio.apply()
 
 def extract_hyperlinks_from_docx(docx_file):
@@ -88,50 +90,107 @@ def get_domain(url):
     except:
         return url
 
-async def check_url_async(session, url, delay=1):
+def is_image_url(url):
+    """Check if URL points to an image based on extension or content type."""
+    parsed = urlparse(url)
+    path = parsed.path.lower()
+    return any(path.endswith(ext) for ext in ['.jpg', '.jpeg', '.png', '.gif', '.bmp', '.webp'])
+
+async def check_url_async(session, url, delay=1, max_retries=3):
     """Asynchronously check if a URL is accessible and return its status and content."""
-    try:
-        headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
-        }
-        
-        # First request to check accessibility
-        async with session.get(url, headers=headers, timeout=10) as response:
-            status = response.status
+    retry_count = 0
+    while retry_count < max_retries:
+        try:
+            headers = {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+            }
             
-            # Wait before getting content
-            await asyncio.sleep(delay)
-            
-            # Second request to get content
-            async with session.get(url, headers=headers, timeout=10) as content_response:
-                text = await content_response.text()
+            # First request to check accessibility
+            async with session.get(url, headers=headers, timeout=10, allow_redirects=True) as response:
+                status = response.status
+                final_url = str(response.url)
                 
-                # Try to get readable content using BeautifulSoup
-                soup = BeautifulSoup(text, 'html.parser')
+                # Handle redirects explicitly
+                if final_url != url:
+                    redirect_info = f"(Redirected to: {final_url})"
+                else:
+                    redirect_info = ""
                 
-                # Remove script and style elements
-                for script in soup(["script", "style"]):
-                    script.decompose()
+                # Check if it's an image URL
+                if is_image_url(final_url) or 'image' in response.headers.get('content-type', '').lower():
+                    return {
+                        'status': 'Success',
+                        'status_code': status,
+                        'content_preview': f"✓ Image content confirmed {redirect_info}"
+                    }
+                
+                # Wait before getting content
+                await asyncio.sleep(delay)
+                
+                # Second request to get content
+                async with session.get(final_url, headers=headers, timeout=10) as content_response:
+                    text = await content_response.text()
                     
-                # Get text content
-                content = soup.get_text()
-                
-                # Clean up text
-                lines = (line.strip() for line in content.splitlines())
-                chunks = (phrase.strip() for line in lines for phrase in line.split("  "))
-                content = ' '.join(chunk for chunk in chunks if chunk)
-                
-                return {
-                    'status': 'Success',
-                    'status_code': status,
-                    'content_preview': content[:500] + '...' if len(content) > 500 else content
-                }
-    except Exception as e:
-        return {
-            'status': 'Error',
-            'status_code': getattr(e, 'status', None) if hasattr(e, 'status') else None,
-            'content_preview': str(e)
-        }
+                    # Check for rate limiting indicators
+                    rate_limit_indicators = ['too many requests', 'rate limit', 'try again later', '429']
+                    if any(indicator in text.lower() for indicator in rate_limit_indicators) or status == 429:
+                        if retry_count < max_retries - 1:
+                            retry_count += 1
+                            await asyncio.sleep(7)  # Wait 7 seconds before retrying
+                            continue
+                    
+                    # Try to get readable content using BeautifulSoup
+                    soup = BeautifulSoup(text, 'html.parser')
+                    
+                    # Remove script and style elements
+                    for script in soup(["script", "style"]):
+                        script.decompose()
+                        
+                    # Get text content
+                    content = soup.get_text()
+                    
+                    # Clean up text
+                    lines = (line.strip() for line in content.splitlines())
+                    chunks = (phrase.strip() for line in lines for phrase in line.split("  "))
+                    content = ' '.join(chunk for chunk in chunks if chunk)
+                    
+                    # If content is just "Redirecting..." or similar, try to find more info
+                    if content.lower().strip() in ['redirecting', 'redirecting...', '']:
+                        # Try to find a redirect URL or title
+                        redirect_url = soup.find('meta', attrs={'http-equiv': 'refresh'})
+                        title = soup.find('title')
+                        if redirect_url:
+                            content = f"Redirect page. {redirect_info}"
+                        elif title:
+                            content = f"Page title: {title.text.strip()} {redirect_info}"
+                        else:
+                            content = f"Valid page with minimal content {redirect_info}"
+                    
+                    return {
+                        'status': 'Success',
+                        'status_code': status,
+                        'content_preview': content[:500] + '...' if len(content) > 500 else content
+                    }
+                    
+        except Exception as e:
+            error_msg = str(e).lower()
+            if any(msg in error_msg for msg in ['too many requests', 'rate limit', '429']):
+                if retry_count < max_retries - 1:
+                    retry_count += 1
+                    await asyncio.sleep(7)  # Wait 7 seconds before retrying
+                    continue
+            return {
+                'status': 'Error',
+                'status_code': getattr(e, 'status', None) if hasattr(e, 'status') else None,
+                'content_preview': str(e)
+            }
+        retry_count += 1
+    
+    return {
+        'status': 'Error',
+        'status_code': 429,
+        'content_preview': 'Max retries exceeded - Rate limiting or server issues'
+    }
 
 async def process_domain_group(session, domain_urls, delay=1):
     """Process all URLs from the same domain with delays."""
