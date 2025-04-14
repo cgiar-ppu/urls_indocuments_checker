@@ -396,7 +396,7 @@ def main():
                 duplicate_count = total_urls - unique_urls
 
                 st.success(
-                    f"✨ Found {total_urls} total URLs ({unique_urls} unique, {duplicate_count} duplicates)")
+                    f"✨ Found {total_urls} total URLs ({unique_urls} unique")
 
             # Display URLs in a table
             url_df = pd.DataFrame(url_info)
